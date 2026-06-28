@@ -7,7 +7,7 @@
 
 - [PowerShell](https://learn.microsoft.com/zh-tw/powershell/scripting/install/install-powershell-on-windows?view=powershell-7.6)（用這個執行指令）
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)（用於解析串流路徑跟查詢命名）
-- [ffmpeg](https://ffmpeg.org/)（NVIDIA 驅動裝好才能用 NVENC）
+- [ffmpeg](https://ffmpeg.org/)（用於串流下載以及重新壓縮，NVIDIA 顯卡驅動裝好才能用 NVENC）
 - [Deno](https://deno.com/)（用於 YouTube JS 解析）
 
 ## 安裝
