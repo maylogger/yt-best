@@ -1,6 +1,7 @@
 # yt-best
 
 從 YouTube 下載指定時間片段，並以 NVENC 轉成可在 Windows 預覽的 MP4。
+目前為 windows 專用，有 Mac 或手機需求的要自己下載請 AI 改。
 
 ## 需求
 
@@ -15,9 +16,17 @@
 .\install.ps1
 ```
 
-會複製 `yt-best.ps1` 到 `%USERPROFILE%\.local\bin`，並設定 PATH / PATHEXT。
+會自動複製 `yt-best.ps1` 到 `%USERPROFILE%\.local\bin`，並設定 PATH / PATHEXT。
 
 ## 用法
+
+簡單說就是用 PowerShell 打開後輸入：
+
+```powershell
+yt-best {yt網址} {起始時間} {結束時間}
+```
+
+舉例：
 
 ```powershell
 yt-best https://www.youtube.com/watch?v=VIDEO_ID 55:41 1:00:48
