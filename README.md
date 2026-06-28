@@ -38,8 +38,8 @@ yt-best https://www.youtube.com/watch?v=VIDEO_ID 55:41 1:00:48
 clip-{YouTube 標題}-{開始}_{結束}.mp4
 ```
 
-## 流程
+他會自動跑這個流程
 
 1. yt-dlp 以 HLS 下載指定片段到 `temp-clip-....mp4`
-2. ffmpeg NVENC H.264（CQ 35）+ 音訊 copy + faststart
+2. 會自動用 ffmpeg NVENC H.264（CQ 35）+ 音訊 copy + faststart 重壓縮小檔案跟同步影音問題
 3. 成功後刪除 temp 檔；中斷或失敗時保留 temp 檔
