@@ -41,5 +41,5 @@ yt-best https://www.youtube.com/watch?v=vBX1GpS8qLk 55:41 1:00:48
 最後給你的檔名是：
 
 ```
-clip-{YouTube 標題}-{開始}_{結束}.mp4
+clip-{YouTube 標題}-{開始時間}_{結束時間}.mp4
 ```
