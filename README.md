@@ -12,7 +12,7 @@
 
 ## 安裝
 
-```powershell
+```
 .\install.ps1
 ```
 
@@ -22,19 +22,19 @@
 
 簡單說就是用 PowerShell 打開後輸入：
 
-```powershell
+```
 yt-best {yt網址} {起始時間} {結束時間}
 ```
 
 舉例：
 
-```powershell
+```
 yt-best https://www.youtube.com/watch?v=VIDEO_ID 55:41 1:00:48
 ```
 
 輸出檔名：
 
-```text
+```
 clip-{YouTube 標題}-{開始}_{結束}.mp4
 ```
 
