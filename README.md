@@ -1,5 +1,7 @@
 # yt-best
 
+![](yt-best.ps1.png)
+
 從 YouTube 下載指定時間片段，並以 NVENC 轉成可在 Windows 預覽的 MP4。
 目前為 windows 專用，有 Mac 或手機需求的要自己下載請 AI 改。
 
