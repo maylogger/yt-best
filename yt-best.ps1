@@ -103,13 +103,15 @@ function ConvertTo-SafeTimeToken {
 
 $workDir = Get-Location
 $section = "*$Start-$End"
-$format = '301/300/93/91'
+# HLS only（支援 --download-sections 只抓片段）；AV1 優先，無 AV1 時退回 H.264 HLS
+# 301/300=AV1 HLS，96/95=1080p/720p H.264 HLS，93/91=較低畫質 H.264 HLS
+$format = '301/300/96/95/93/91'
 
 Write-Host ''
 Write-Host 'yt-best 開始處理' -ForegroundColor Yellow
 Write-Host "  URL   : $Url"
 Write-Host "  時段  : $Start -> $End"
-Write-Host "  方式  : HLS 片段下載 + NVENC H.264 (CQ 35, 音訊 copy)"
+Write-Host "  方式  : HLS 片段下載（自動選最佳可用畫質）+ NVENC H.264 (CQ 35, 音訊 copy)"
 Write-Host ''
 
 $tempPath = $null
