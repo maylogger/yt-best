@@ -44,6 +44,21 @@ function Write-Done {
   Write-Host "[OK] $Message" -ForegroundColor Green
 }
 
+function Write-ShareText {
+  param(
+    [string]$Title,
+    [string]$Url,
+    [string]$Start,
+    [string]$End
+  )
+
+  Write-Host ''
+  Write-Host "來源分享： $Title"
+  Write-Host "影片網址： $Url"
+  Write-Host "起始時間： $Start"
+  Write-Host "結束時間： $End"
+}
+
 function Get-YtDlpJsRuntimeArgs {
   if (Get-Command deno -ErrorAction SilentlyContinue) {
     return @()
@@ -101,23 +116,105 @@ function ConvertTo-SafeTimeToken {
   return ($Time -replace ':', '-')
 }
 
+function Test-VideoHasHls {
+  param(
+    [string[]]$JsArgs,
+    [string]$Url
+  )
+
+  $formats = (& yt-dlp @JsArgs -F --no-warnings $Url | Out-String)
+  if ($LASTEXITCODE -ne 0) {
+    throw 'yt-dlp 無法列出影片格式'
+  }
+
+  return ($formats -match '\bm3u8\b')
+}
+
+function Read-DownloadFallbackConfirmation {
+  $response = Read-Host '[!] 警告：這支影片沒有 HLS/m3u8。你要改成整支下載後裁切嗎？(Y/n)'
+  if ([string]::IsNullOrWhiteSpace($response)) {
+    return $true
+  }
+
+  return ($response -notmatch '^[Nn]')
+}
+
+function Invoke-ClipTranscode {
+  param(
+    [string]$InputPath,
+    [string]$OutputPath,
+    [string]$Start = $null,
+    [string]$End = $null
+  )
+
+  $ffmpegArgs = @(
+    '-hide_banner'
+    '-loglevel', 'warning'
+    '-stats'
+    '-stats_period', '2'
+    '-i', $InputPath
+  )
+
+  if ($Start -and $End) {
+    $ffmpegArgs += @('-ss', $Start, '-to', $End)
+  }
+
+  $ffmpegArgs += @(
+    '-map', '0:v:0'
+    '-map', '0:a:0?'
+    '-c:v', 'h264_nvenc'
+    '-rc', 'vbr'
+    '-cq', '35'
+    '-b:v', '0'
+    '-pix_fmt', 'yuv420p'
+    '-fps_mode', 'vfr'
+    '-c:a', 'copy'
+    '-movflags', '+faststart'
+    '-y', $OutputPath
+  )
+
+  & ffmpeg @ffmpegArgs
+  if ($LASTEXITCODE -ne 0) {
+    throw 'ffmpeg 轉檔失敗'
+  }
+}
+
 $workDir = Get-Location
 $section = "*$Start-$End"
 # HLS only（支援 --download-sections 只抓片段）；AV1 優先，無 AV1 時退回 H.264 HLS
 # 301/300=AV1 HLS，96/95=1080p/720p H.264 HLS，93/91=較低畫質 H.264 HLS
-$format = '301/300/96/95/93/91'
+$hlsFormat = '301/300/96/95/93/91'
+# 無 HLS 時整支下載：最佳視訊 + 最佳音訊，合併成 mp4
+$fullFormat = 'bv*+ba/b'
 
 Write-Host ''
 Write-Host 'yt-best 開始處理' -ForegroundColor Yellow
 Write-Host "  URL   : $Url"
 Write-Host "  時段  : $Start -> $End"
-Write-Host "  方式  : HLS 片段下載（自動選最佳可用畫質）+ NVENC H.264 (CQ 35, 音訊 copy)"
 Write-Host ''
 
 $tempPath = $null
 
 try {
   $jsArgs = Get-YtDlpJsRuntimeArgs
+
+  Write-Step '正在檢查影片是否提供 HLS 串流...'
+  $useHlsDownload = Test-VideoHasHls -JsArgs $jsArgs -Url $Url
+  if (-not $useHlsDownload) {
+    if (-not (Read-DownloadFallbackConfirmation)) {
+      Write-Host ''
+      Write-Host '[!] 已停止下載。' -ForegroundColor Yellow
+      exit 0
+    }
+  }
+
+  if ($useHlsDownload) {
+    Write-Host '  方式  : HLS 片段下載（自動選最佳可用畫質）+ NVENC H.264 (CQ 35, 音訊 copy)'
+  }
+  else {
+    Write-Host '  方式  : 整支下載（最佳影音畫質）→ 裁切指定時段 → NVENC H.264 (CQ 35, 音訊 copy)'
+  }
+  Write-Host ''
 
   Write-Step '正在取得 YouTube 影片名稱...'
   $videoTitle = Get-VideoTitle -JsArgs $jsArgs -Url $Url
@@ -133,22 +230,40 @@ try {
   Write-Host "  輸出  : $outputPath"
   Write-Host ''
 
-  Write-Step '正在解析影片並下載指定片段 (yt-dlp)...'
-  Write-Host '      解析完後會顯示 [download] 進度，請稍候'
+  if ($useHlsDownload) {
+    Write-Step '正在解析影片並下載指定片段 (yt-dlp)...'
+  }
+  else {
+    Write-Step '正在下載完整影片 (yt-dlp，最佳影音畫質)...'
+  }
+  Write-Host '      解析完後進度會在同一行更新，請稍候'
   Write-Host ''
 
-  $ytDlpArgs = $jsArgs + @(
-    '--download-sections', $section
-    '--force-keyframes-at-cuts'
-    '-f', $format
-    '--force-overwrites'
-    '--no-part'
-    '--progress'
-    '--newline'
-    '--downloader-args', 'ffmpeg:-loglevel warning -stats -stats_period 2'
-    '-o', $tempPath
-    $Url
-  )
+  if ($useHlsDownload) {
+    $ytDlpArgs = $jsArgs + @(
+      '--download-sections', $section
+      '--force-keyframes-at-cuts'
+      '-f', $hlsFormat
+      '--force-overwrites'
+      '--no-part'
+      '--progress'
+      '--downloader-args', 'ffmpeg:-loglevel warning -stats -stats_period 2'
+      '-o', $tempPath
+      $Url
+    )
+  }
+  else {
+    $ytDlpArgs = $jsArgs + @(
+      '-f', $fullFormat
+      '--merge-output-format', 'mp4'
+      '--force-overwrites'
+      '--no-part'
+      '--progress'
+      '--downloader-args', 'ffmpeg:-loglevel warning -stats -stats_period 2'
+      '-o', $tempPath
+      $Url
+    )
+  }
 
   & yt-dlp @ytDlpArgs
   if ($LASTEXITCODE -ne 0) {
@@ -160,35 +275,26 @@ try {
   }
 
   Write-Host ''
-  Write-Step '正在轉檔 (ffmpeg NVENC H.264 CQ 35, 音訊 copy, VFR, faststart)...'
+  if ($useHlsDownload) {
+    Write-Step '正在轉檔 (ffmpeg NVENC H.264 CQ 35, 音訊 copy, VFR, faststart)...'
+  }
+  else {
+    Write-Step "正在裁切 $Start -> $End 並轉檔 (ffmpeg NVENC H.264 CQ 35, 音訊 copy, VFR, faststart)..."
+  }
   Write-Host ''
 
-  & ffmpeg `
-    -hide_banner `
-    -loglevel warning `
-    -stats `
-    -stats_period 2 `
-    -i $tempPath `
-    -map 0:v:0 `
-    -map 0:a:0? `
-    -c:v h264_nvenc `
-    -rc vbr `
-    -cq 35 `
-    -b:v 0 `
-    -pix_fmt yuv420p `
-    -fps_mode vfr `
-    -c:a copy `
-    -movflags +faststart `
-    -y $outputPath
-
-  if ($LASTEXITCODE -ne 0) {
-    throw 'ffmpeg 轉檔失敗'
+  if ($useHlsDownload) {
+    Invoke-ClipTranscode -InputPath $tempPath -OutputPath $outputPath
+  }
+  else {
+    Invoke-ClipTranscode -InputPath $tempPath -OutputPath $outputPath -Start $Start -End $End
   }
 
   Write-Host ''
   if (Test-Path $outputPath) {
     $sizeMb = [math]::Round((Get-Item $outputPath).Length / 1MB, 2)
-    Write-Done "完成！已輸出 $outputPath ($sizeMb MB)"
+    Write-Done "完成！檔案已輸出 $outputPath ($sizeMb MB)"
+    Write-ShareText -Title $videoTitle -Url $Url -Start $Start -End $End
 
     if (Test-Path $tempPath) {
       Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
