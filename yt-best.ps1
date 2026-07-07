@@ -116,6 +116,85 @@ function ConvertTo-SafeTimeToken {
   return ($Time -replace ':', '-')
 }
 
+function ConvertTo-TimeSpanFromClock {
+  param([string]$Time)
+
+  $parts = $Time -split ':'
+  switch ($parts.Count) {
+    2 {
+      return [TimeSpan]::FromMinutes([int]$parts[0]) + [TimeSpan]::FromSeconds([int]$parts[1])
+    }
+    3 {
+      return [TimeSpan]::FromHours([int]$parts[0]) + [TimeSpan]::FromMinutes([int]$parts[1]) + [TimeSpan]::FromSeconds([int]$parts[2])
+    }
+    default {
+      throw "無法解析時間：$Time"
+    }
+  }
+}
+
+function Get-ClipDurationToken {
+  param(
+    [string]$Start,
+    [string]$End
+  )
+
+  $duration = ConvertTo-TimeSpanFromClock $End - ConvertTo-TimeSpanFromClock $Start
+  if ($duration.TotalSeconds -le 0) {
+    throw "結束時間必須晚於起始時間：$Start -> $End"
+  }
+
+  return $duration.ToString('c')
+}
+
+function Test-UsableTrimFile {
+  param(
+    [string]$TrimPath,
+    [string]$FullPath,
+    [string]$Start,
+    [string]$End
+  )
+
+  if (-not (Test-UsableMediaFile $TrimPath)) {
+    return $false
+  }
+
+  if (-not (Test-UsableMediaFile $FullPath)) {
+    return $true
+  }
+
+  $trimSize = (Get-Item $TrimPath).Length
+  $fullSize = (Get-Item $FullPath).Length
+  $durationSec = (ConvertTo-TimeSpanFromClock $End - ConvertTo-TimeSpanFromClock $Start).TotalSeconds
+
+  if ($trimSize -gt ($fullSize * 0.8)) {
+    return $false
+  }
+
+  $maxExpectedBytes = [math]::Max(200MB, $durationSec * 5MB)
+  if ($trimSize -gt $maxExpectedBytes) {
+    return $false
+  }
+
+  return $true
+}
+
+function Test-UsableMediaFile {
+  param([string]$Path)
+
+  if (-not (Test-Path $Path)) {
+    return $false
+  }
+
+  return (Get-Item $Path).Length -gt 0
+}
+
+function Get-MediaFileSizeMb {
+  param([string]$Path)
+
+  return [math]::Round((Get-Item $Path).Length / 1MB, 2)
+}
+
 function Test-VideoHasHls {
   param(
     [string[]]$JsArgs,
@@ -139,27 +218,159 @@ function Read-DownloadFallbackConfirmation {
   return ($response -notmatch '^[Nn]')
 }
 
-function Invoke-ClipTranscode {
+function Write-InlineProgress {
+  param(
+    [string]$Message,
+    [switch]$Final
+  )
+
+  if ($Final) {
+    Write-Host $Message
+    return
+  }
+
+  if ([Console]::IsOutputRedirected) {
+    return
+  }
+
+  try {
+    $width = 100
+    $consoleWidth = [Console]::WindowWidth
+    if ($consoleWidth -gt 40) {
+      $width = $consoleWidth - 1
+    }
+
+    [Console]::Write("`r" + $Message.PadRight($width))
+  }
+  catch {
+    # 進行中更新失敗時略過，避免中斷轉檔
+  }
+}
+
+function Invoke-FfmpegWithProgress {
+  param(
+    [string[]]$FfmpegArgs,
+    [string]$ProgressLabel,
+    [string]$FailureMessage
+  )
+
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = 'ffmpeg'
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $false
+  $psi.CreateNoWindow = $true
+
+  if ($psi.PSObject.Properties.Name -contains 'ArgumentList') {
+    foreach ($arg in $FfmpegArgs) {
+      [void]$psi.ArgumentList.Add($arg)
+    }
+  }
+  else {
+    $escapedArgs = $FfmpegArgs | ForEach-Object {
+      if ($_ -match '[\s"]') {
+        '"' + ($_ -replace '"', '\"') + '"'
+      }
+      else {
+        $_
+      }
+    }
+    $psi.Arguments = $escapedArgs -join ' '
+  }
+
+  $process = New-Object System.Diagnostics.Process
+  $process.StartInfo = $psi
+
+  [void]$process.Start()
+
+  $progressData = @{}
+  while ($true) {
+    $line = $process.StandardOutput.ReadLine()
+    if ($null -eq $line) {
+      if ($process.HasExited) {
+        break
+      }
+
+      Start-Sleep -Milliseconds 50
+      continue
+    }
+
+    if ($line -notmatch '^([^=]+)=(.*)$') {
+      continue
+    }
+
+    $progressData[$Matches[1]] = $Matches[2]
+    if ($Matches[1] -ne 'progress') {
+      continue
+    }
+
+    $time = if ($progressData['out_time']) {
+      ($progressData['out_time'] -replace '\.\d+$', '')
+    }
+    else {
+      '00:00:00'
+    }
+    $speed = if ($progressData['speed']) { $progressData['speed'] } else { '?' }
+    $sizeMb = if ($progressData['total_size']) {
+      '{0:N2}' -f ([double]$progressData['total_size'] / 1MB)
+    }
+    else {
+      '?'
+    }
+
+    if ($Matches[2] -eq 'end') {
+      Write-InlineProgress "[$ProgressLabel] 完成 time=$time speed=$speed size=${sizeMb}MB" -Final
+    }
+    else {
+      Write-InlineProgress "[$ProgressLabel] time=$time speed=$speed size=${sizeMb}MB"
+    }
+  }
+
+  $process.WaitForExit()
+
+  if ($process.ExitCode -ne 0) {
+    throw $FailureMessage
+  }
+}
+
+function Invoke-ClipTrim {
   param(
     [string]$InputPath,
     [string]$OutputPath,
-    [string]$Start = $null,
-    [string]$End = $null
+    [string]$Start,
+    [string]$End
   )
 
   $ffmpegArgs = @(
     '-hide_banner'
-    '-loglevel', 'warning'
-    '-stats'
-    '-stats_period', '2'
+    '-loglevel', 'error'
+    '-nostats'
+    '-progress', 'pipe:1'
+    '-ss', $Start
+    '-to', $End
     '-i', $InputPath
+    '-map', '0:v:0'
+    '-map', '0:a:0?'
+    '-c', 'copy'
+    '-movflags', '+faststart'
+    '-y', $OutputPath
   )
 
-  if ($Start -and $End) {
-    $ffmpegArgs += @('-ss', $Start, '-to', $End)
-  }
+  Invoke-FfmpegWithProgress -FfmpegArgs $ffmpegArgs -ProgressLabel 'TRIM' -FailureMessage 'ffmpeg 裁切失敗'
+}
 
-  $ffmpegArgs += @(
+function Invoke-ClipTranscode {
+  param(
+    [string]$InputPath,
+    [string]$OutputPath
+  )
+
+  $ffmpegArgs = @(
+    '-hide_banner'
+    '-loglevel', 'error'
+    '-nostats'
+    '-progress', 'pipe:1'
+    '-i', $InputPath
     '-map', '0:v:0'
     '-map', '0:a:0?'
     '-c:v', 'h264_nvenc'
@@ -173,10 +384,7 @@ function Invoke-ClipTranscode {
     '-y', $OutputPath
   )
 
-  & ffmpeg @ffmpegArgs
-  if ($LASTEXITCODE -ne 0) {
-    throw 'ffmpeg 轉檔失敗'
-  }
+  Invoke-FfmpegWithProgress -FfmpegArgs $ffmpegArgs -ProgressLabel 'ENC' -FailureMessage 'ffmpeg 轉檔失敗'
 }
 
 $workDir = Get-Location
@@ -194,6 +402,7 @@ Write-Host "  時段  : $Start -> $End"
 Write-Host ''
 
 $tempPath = $null
+$trimTempPath = $null
 
 try {
   $jsArgs = Get-YtDlpJsRuntimeArgs
@@ -236,58 +445,86 @@ try {
   else {
     Write-Step '正在下載完整影片 (yt-dlp，最佳影音畫質)...'
   }
-  Write-Host '      解析完後進度會在同一行更新，請稍候'
-  Write-Host ''
 
-  if ($useHlsDownload) {
-    $ytDlpArgs = $jsArgs + @(
-      '--download-sections', $section
-      '--force-keyframes-at-cuts'
-      '-f', $hlsFormat
-      '--force-overwrites'
-      '--no-part'
-      '--progress'
-      '--downloader-args', 'ffmpeg:-loglevel warning -stats -stats_period 2'
-      '-o', $tempPath
-      $Url
-    )
+  if (Test-UsableMediaFile $tempPath) {
+    Write-Host "[!] 發現既有暫存檔 ($(Get-MediaFileSizeMb $tempPath) MB)，跳過下載，直接繼續後續步驟。" -ForegroundColor Yellow
+    Write-Host ''
   }
   else {
-    $ytDlpArgs = $jsArgs + @(
-      '-f', $fullFormat
-      '--merge-output-format', 'mp4'
-      '--force-overwrites'
-      '--no-part'
-      '--progress'
-      '--downloader-args', 'ffmpeg:-loglevel warning -stats -stats_period 2'
-      '-o', $tempPath
-      $Url
-    )
+    Write-Host '      解析完後進度會在同一行更新，請稍候'
+    Write-Host ''
+
+    if ($useHlsDownload) {
+      $ytDlpArgs = $jsArgs + @(
+        '--download-sections', $section
+        '--force-keyframes-at-cuts'
+        '-f', $hlsFormat
+        '--force-overwrites'
+        '--no-part'
+        '--progress'
+        '--downloader-args', 'ffmpeg:-loglevel warning -stats -stats_period 2'
+        '-o', $tempPath
+        $Url
+      )
+    }
+    else {
+      $ytDlpArgs = $jsArgs + @(
+        '-f', $fullFormat
+        '--merge-output-format', 'mp4'
+        '--force-overwrites'
+        '--no-part'
+        '--progress'
+        '--downloader-args', 'ffmpeg:-loglevel warning -stats -stats_period 2'
+        '-o', $tempPath
+        $Url
+      )
+    }
+
+    & yt-dlp @ytDlpArgs
+    if ($LASTEXITCODE -ne 0) {
+      if (Test-UsableMediaFile $tempPath) {
+        Write-Host "[!] 下載失敗，但暫存檔可用 ($(Get-MediaFileSizeMb $tempPath) MB)，繼續後續步驟。" -ForegroundColor Yellow
+        Write-Host ''
+      }
+      else {
+        throw 'yt-dlp 下載失敗'
+      }
+    }
   }
 
-  & yt-dlp @ytDlpArgs
-  if ($LASTEXITCODE -ne 0) {
-    throw 'yt-dlp 下載失敗'
-  }
-
-  if (-not (Test-Path $tempPath)) {
+  if (-not (Test-UsableMediaFile $tempPath)) {
     throw "找不到暫存檔案：$tempPath"
   }
 
   Write-Host ''
   if ($useHlsDownload) {
     Write-Step '正在轉檔 (ffmpeg NVENC H.264 CQ 35, 音訊 copy, VFR, faststart)...'
-  }
-  else {
-    Write-Step "正在裁切 $Start -> $End 並轉檔 (ffmpeg NVENC H.264 CQ 35, 音訊 copy, VFR, faststart)..."
-  }
-  Write-Host ''
-
-  if ($useHlsDownload) {
+    Write-Host ''
     Invoke-ClipTranscode -InputPath $tempPath -OutputPath $outputPath
   }
   else {
-    Invoke-ClipTranscode -InputPath $tempPath -OutputPath $outputPath -Start $Start -End $End
+    $trimTempPath = Join-Path $workDir "trim-$finalName"
+
+    if (Test-UsableTrimFile -TrimPath $trimTempPath -FullPath $tempPath -Start $Start -End $End) {
+      Write-Host "[!] 發現既有裁切暫存檔 ($(Get-MediaFileSizeMb $trimTempPath) MB)，跳過裁切，直接轉檔。" -ForegroundColor Yellow
+      Write-Host ''
+    }
+    else {
+      if (Test-UsableMediaFile $trimTempPath) {
+        Write-Host "[!] 既有裁切暫存檔 ($(Get-MediaFileSizeMb $trimTempPath) MB) 大小異常，重新裁切。" -ForegroundColor Yellow
+        Write-Host ''
+      }
+
+      Write-Step "正在裁切 $Start -> $End (ffmpeg stream copy)..."
+      Write-Host ''
+      Invoke-ClipTrim -InputPath $tempPath -OutputPath $trimTempPath -Start $Start -End $End
+
+      Write-Host ''
+    }
+
+    Write-Step '正在轉檔 (ffmpeg NVENC H.264 CQ 35, 音訊 copy, VFR, faststart)...'
+    Write-Host ''
+    Invoke-ClipTranscode -InputPath $trimTempPath -OutputPath $outputPath
   }
 
   Write-Host ''
@@ -300,7 +537,15 @@ try {
       Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
     }
 
+    if ($trimTempPath -and (Test-Path $trimTempPath)) {
+      Remove-Item $trimTempPath -Force -ErrorAction SilentlyContinue
+    }
+
     Get-ChildItem -Path $workDir -Filter "temp-$finalName*" -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -like '*.part' -or $_.Name -like '*.ytdl' } |
+      Remove-Item -Force -ErrorAction SilentlyContinue
+
+    Get-ChildItem -Path $workDir -Filter "trim-$finalName*" -ErrorAction SilentlyContinue |
       Where-Object { $_.Name -like '*.part' -or $_.Name -like '*.ytdl' } |
       Remove-Item -Force -ErrorAction SilentlyContinue
   }
@@ -312,6 +557,11 @@ catch {
   Write-Host ''
   if ($tempPath -and (Test-Path $tempPath)) {
     Write-Host "[!] 已保留暫存檔：$tempPath" -ForegroundColor Yellow
+    Write-Host '    可稍後手動轉檔，或重新執行 yt-best' -ForegroundColor Yellow
+  }
+
+  if ($trimTempPath -and (Test-Path $trimTempPath)) {
+    Write-Host "[!] 已保留裁切暫存檔：$trimTempPath" -ForegroundColor Yellow
     Write-Host '    可稍後手動轉檔，或重新執行 yt-best' -ForegroundColor Yellow
   }
 
