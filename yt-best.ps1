@@ -405,7 +405,7 @@ $tempPath = $null
 $trimTempPath = $null
 
 try {
-  $jsArgs = Get-YtDlpJsRuntimeArgs
+  $jsArgs = Get-YtDlpJsRuntimeArgs + @('--no-playlist')
 
   Write-Step '正在檢查影片是否提供 HLS 串流...'
   $useHlsDownload = Test-VideoHasHls -JsArgs $jsArgs -Url $Url
