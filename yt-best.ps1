@@ -59,17 +59,81 @@ function Write-ShareText {
   Write-Host "結束時間： $End"
 }
 
+function Get-DenoExecutable {
+  $deno = Get-Command deno -ErrorAction SilentlyContinue
+  if ($deno) {
+    return $deno.Source
+  }
+
+  $candidates = @(
+    (Join-Path $env:USERPROFILE '.deno\bin\deno.exe')
+    (Join-Path $env:LOCALAPPDATA 'deno\deno.exe')
+  )
+
+  foreach ($candidate in $candidates) {
+    if (Test-Path $candidate) {
+      return $candidate
+    }
+  }
+
+  return $null
+}
+
+function Join-YtDlpArgs {
+  param([object[]]$Parts)
+
+  $result = [System.Collections.Generic.List[string]]::new()
+  foreach ($part in $Parts) {
+    if ($null -eq $part) {
+      continue
+    }
+
+    foreach ($item in @($part)) {
+      [void]$result.Add([string]$item)
+    }
+  }
+
+  return ,@([string[]]$result.ToArray())
+}
+
 function Get-YtDlpJsRuntimeArgs {
+  # yt-dlp 預設已啟用 deno；PATH 找得到就不必傳參
   if (Get-Command deno -ErrorAction SilentlyContinue) {
-    return @()
+    return [string[]]@()
+  }
+
+  $denoPath = Get-DenoExecutable
+  if ($denoPath) {
+    # Windows 路徑改用 /，避免 deno:C:\ 被誤判成 runtime 名稱
+    $denoUnixPath = $denoPath -replace '\\', '/'
+    return @('--js-runtimes', "deno:$denoUnixPath")
   }
 
   if (Get-Command node -ErrorAction SilentlyContinue) {
-    return @('--js-runtimes', 'node')
+    Write-Warning '未找到 Deno。YouTube m3u8/HLS 可能無法偵測，建議安裝 Deno 2.3+。'
+    return [string[]]@()
   }
 
   Write-Warning '未找到 Deno 或 Node.js，YouTube 解析可能失敗。建議安裝 Deno 2.3+。'
-  return @()
+  return [string[]]@()
+}
+
+function Test-DenoAvailable {
+  if (Get-DenoExecutable) {
+    return $true
+  }
+
+  return [bool](Get-DenoExecutable)
+}
+
+function Get-YtDlpHlsProbeArgs {
+  param([string[]]$JsArgs)
+
+  return Join-YtDlpArgs $JsArgs, '--no-cache-dir'
+}
+
+function Get-YtDlpHlsDownloadArgs {
+  return @('--no-cache-dir')
 }
 
 function ConvertTo-SafeFileName {
@@ -195,22 +259,182 @@ function Get-MediaFileSizeMb {
   return [math]::Round((Get-Item $Path).Length / 1MB, 2)
 }
 
+function Test-YtDlpOutputIndicatesBot {
+  param([string]$Text)
+
+  if ([string]::IsNullOrWhiteSpace($Text)) {
+    return $false
+  }
+
+  return ($Text -match "Sign in to confirm|not a bot|confirm you.?re not|HTTP Error 403|This content isn.t available")
+}
+
+function Test-YtDlpFormatsOutputHasM3u8 {
+  param([string]$Output)
+
+  if ([string]::IsNullOrWhiteSpace($Output)) {
+    return $false
+  }
+
+  if ($Output -match 'Downloading m3u8 information') {
+    return $true
+  }
+
+  # 對齊 yt-dlp -F 表格 PROTO 欄的 m3u8（-J 的 JSON 常漏掉 m3u8）
+  return ($Output -match '\|\s*m3u8(_native)?\s*\|' -or $Output -match '\s+m3u8(_native)?\s+\│')
+}
+
+function Test-YtDlpFormatsOutputGotFormats {
+  param([string]$Output)
+
+  if ([string]::IsNullOrWhiteSpace($Output)) {
+    return $false
+  }
+
+  return ($Output -match 'Available formats for' -or $Output -match '\|\s*https\s*\|')
+}
+
+function Test-YtDlpOutputUsedAndroidVrFastPath {
+  param(
+    [string]$Output,
+    [bool]$HasM3u8,
+    [bool]$GotFormats
+  )
+
+  if (-not $GotFormats -or $HasM3u8) {
+    return $false
+  }
+
+  if ($Output -match 'Downloading m3u8 information|Downloading player|\[jsc:deno\]') {
+    return $false
+  }
+
+  return ($Output -match 'Downloading android vr player API JSON')
+}
+
+function Test-YtDlpHlsProbe {
+  param(
+    [string[]]$JsArgs,
+    [string]$Url
+  )
+
+  $previousErrorAction = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+
+  try {
+    $lines = & yt-dlp @JsArgs -F --no-download $Url 2>&1
+    $outputText = ($lines | ForEach-Object { $_.ToString() }) -join "`n"
+
+    if (Test-YtDlpOutputIndicatesBot $outputText) {
+      return @{
+        HasM3u8 = $false
+        BotDetected = $true
+        GotFormats = $false
+        UsedAndroidVrFastPath = $false
+      }
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+      return @{
+        HasM3u8 = $false
+        BotDetected = $false
+        GotFormats = $false
+        UsedAndroidVrFastPath = $false
+      }
+    }
+
+    $hasM3u8 = Test-YtDlpFormatsOutputHasM3u8 $outputText
+    $gotFormats = Test-YtDlpFormatsOutputGotFormats $outputText
+
+    return @{
+      HasM3u8 = $hasM3u8
+      BotDetected = $false
+      GotFormats = $gotFormats
+      UsedAndroidVrFastPath = (Test-YtDlpOutputUsedAndroidVrFastPath -Output $outputText -HasM3u8 $hasM3u8 -GotFormats $gotFormats)
+    }
+  }
+  finally {
+    $ErrorActionPreference = $previousErrorAction
+  }
+}
+
 function Test-VideoHasHls {
   param(
     [string[]]$JsArgs,
     [string]$Url
   )
 
-  $formats = (& yt-dlp @JsArgs -F --no-warnings $Url | Out-String)
-  if ($LASTEXITCODE -ne 0) {
-    throw 'yt-dlp 無法列出影片格式'
+  # 最多 2 次 -F：第一次檢查；僅 android vr 快取路徑時才重試一次
+  $probeArgs = Get-YtDlpHlsProbeArgs -JsArgs $JsArgs
+  $probe = Test-YtDlpHlsProbe -JsArgs $probeArgs -Url $Url
+
+  if ($probe.HasM3u8) {
+    return @{
+      HasHls = $true
+      BotBlocked = $false
+      UncertainHls = $false
+    }
   }
 
-  return ($formats -match '\bm3u8\b')
+  if ($probe.BotDetected) {
+    return @{
+      HasHls = $false
+      BotBlocked = $true
+      UncertainHls = $false
+    }
+  }
+
+  if ($probe.UsedAndroidVrFastPath) {
+    $retry = Test-YtDlpHlsProbe -JsArgs $probeArgs -Url $Url
+    if ($retry.HasM3u8) {
+      return @{
+        HasHls = $true
+        BotBlocked = $false
+        UncertainHls = $false
+      }
+    }
+
+    if ($retry.BotDetected) {
+      return @{
+        HasHls = $false
+        BotBlocked = $true
+        UncertainHls = $false
+      }
+    }
+
+    return @{
+      HasHls = $false
+      BotBlocked = $false
+      UncertainHls = $retry.GotFormats
+    }
+  }
+
+  return @{
+    HasHls = $false
+    BotBlocked = $false
+    UncertainHls = $probe.GotFormats
+  }
 }
 
 function Read-DownloadFallbackConfirmation {
-  $response = Read-Host '[!] 警告：這支影片沒有 HLS/m3u8。你要改成整支下載後裁切嗎？(Y/n)'
+  param(
+    [switch]$DenoMissing,
+    [switch]$BotBlocked,
+    [switch]$UncertainHls
+  )
+
+  if ($DenoMissing) {
+    $response = Read-Host '[!] 警告：目前無法取得 HLS/m3u8（需 Deno 完整解析 YouTube）。是否改整支下載後裁切？(Y/n)'
+  }
+  elseif ($BotBlocked) {
+    $response = Read-Host '[!] 警告：YouTube 要求驗證（bot），暫時無法確認 HLS。是否改整支下載後裁切？(Y/n)'
+  }
+  elseif ($UncertainHls) {
+    $response = Read-Host '[!] 警告：暫時無法確認 HLS（yt-dlp 可能走了 android vr 快取路徑）。是否改整支下載後裁切？(Y/n)'
+  }
+  else {
+    $response = Read-Host '[!] 警告：這支影片沒有 HLS/m3u8。你要改成整支下載後裁切嗎？(Y/n)'
+  }
   if ([string]::IsNullOrWhiteSpace($response)) {
     return $true
   }
@@ -405,12 +629,22 @@ $tempPath = $null
 $trimTempPath = $null
 
 try {
-  $jsArgs = Get-YtDlpJsRuntimeArgs + @('--no-playlist')
+  $jsArgs = Join-YtDlpArgs (Get-YtDlpJsRuntimeArgs), '--no-playlist'
 
   Write-Step '正在檢查影片是否提供 HLS 串流...'
-  $useHlsDownload = Test-VideoHasHls -JsArgs $jsArgs -Url $Url
+  if (-not (Test-DenoAvailable)) {
+    Write-Host '[!] 未找到 Deno。YouTube HLS/m3u8 通常無法列出；HLS 檢查可能不準確。' -ForegroundColor Yellow
+  }
+
+  $hlsProbe = Test-VideoHasHls -JsArgs $jsArgs -Url $Url
+  $useHlsDownload = $hlsProbe.HasHls
   if (-not $useHlsDownload) {
-    if (-not (Read-DownloadFallbackConfirmation)) {
+    $denoMissing = -not (Test-DenoAvailable)
+    $botBlocked = $hlsProbe.BotBlocked
+    if ($botBlocked) {
+      Write-Host '[!] 若剛才測試多次，可稍等 15–30 分鐘或執行 yt-dlp --rm-cache-dir 後再試。' -ForegroundColor Yellow
+    }
+    if (-not (Read-DownloadFallbackConfirmation -DenoMissing:$denoMissing -BotBlocked:$botBlocked -UncertainHls:$hlsProbe.UncertainHls)) {
       Write-Host ''
       Write-Host '[!] 已停止下載。' -ForegroundColor Yellow
       exit 0
@@ -455,7 +689,7 @@ try {
     Write-Host ''
 
     if ($useHlsDownload) {
-      $ytDlpArgs = $jsArgs + @(
+      $ytDlpArgs = Join-YtDlpArgs $jsArgs, (Get-YtDlpHlsDownloadArgs), @(
         '--download-sections', $section
         '--force-keyframes-at-cuts'
         '-f', $hlsFormat
@@ -468,7 +702,7 @@ try {
       )
     }
     else {
-      $ytDlpArgs = $jsArgs + @(
+      $ytDlpArgs = Join-YtDlpArgs $jsArgs, (Get-YtDlpHlsDownloadArgs), @(
         '-f', $fullFormat
         '--merge-output-format', 'mp4'
         '--force-overwrites'

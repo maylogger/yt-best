@@ -104,7 +104,30 @@ ffmpeg NVENC 轉檔 → clip-*.mp4          （進度：[ENC]）
 
 HLS 路徑跳過裁切，yt-dlp 直接下載片段後只做 `[ENC]` 轉檔。
 
-## 8. 改完必做
+## 8. HLS 偵測需要 Deno，不可強制 `--js-runtimes node`
+
+### 現象
+
+手動 `yt-dlp -F` 看得到 `m3u8`，但 `Test-VideoHasHls` 回報沒有 HLS。
+
+### 原因
+
+YouTube 的 m3u8 清單需透過 **Deno** 解 JS challenge，且 yt-dlp 會做**額外 API 請求**才列出 m3u8。
+
+若走快取的 `android vr` 精簡路徑（第二次 `-F` 常見），會**跳過** `Downloading player`、`[jsc:deno]`、`Downloading m3u8 information`，格式表只剩 `https`（DASH）。這不是影片沒有 HLS，而是 yt-dlp 沒去查。
+
+### 規則
+
+- HLS **檢查**必須加：`--no-cache-dir` + `--extractor-args youtube:player_client=web_safari,default`
+- HLS **下載**也要加：`--extractor-args youtube:player_client=web_safari,default`
+- 用 `Get-DenoExecutable` 找 Deno（PATH + `%USERPROFILE%\.deno\bin` 等常見路徑）。
+- PATH 已有 `deno` 時**不要**傳 `--js-runtimes`（yt-dlp 預設啟用 deno）。
+- 必須傳路徑時用 `deno:C:/Users/.../deno.exe`（**正斜線**），避免 `deno:C:\` 被截斷。
+- **不要**在沒有 Deno 時強制 `--js-runtimes node`。
+- HLS 檢查用 `yt-dlp -J` 解析 `formats[].protocol`，不要只靠 `-F | Out-String` 搜尋 `m3u8` 字串。
+- `Test-VideoHasHls` 應以多組 js runtime 參數重試（原參數、空參數、`deno`、`deno:/path`）。
+
+## 9. 改完必做
 
 1. 確認語法：`pwsh -NoProfile -File yt-best.ps1`（應 Usage 錯誤，非 ParserError）
 2. 提醒使用者執行 `.\install.ps1` 更新 `~/.local/bin` 的副本
