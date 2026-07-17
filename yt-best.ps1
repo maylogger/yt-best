@@ -126,14 +126,172 @@ function Test-DenoAvailable {
   return [bool](Get-DenoExecutable)
 }
 
+function Get-YtDlpYoutubeHlsExtractorArgs {
+  # web_safari 才較容易帶出 m3u8；default 作備援避免只剩 images
+  return @(
+    '--no-cache-dir'
+    '--extractor-args'
+    'youtube:player_client=web_safari,default'
+  )
+}
+
 function Get-YtDlpHlsProbeArgs {
   param([string[]]$JsArgs)
 
-  return Join-YtDlpArgs $JsArgs, '--no-cache-dir'
+  return Join-YtDlpArgs $JsArgs, (Get-YtDlpYoutubeHlsExtractorArgs)
 }
 
 function Get-YtDlpHlsDownloadArgs {
-  return @('--no-cache-dir')
+  return Get-YtDlpYoutubeHlsExtractorArgs
+}
+
+function Get-YtDlpVideoInfo {
+  param(
+    [string[]]$JsArgs,
+    [string]$Url,
+    [string]$InfoJsonPath
+  )
+
+  $ytArgs = Join-YtDlpArgs $JsArgs, (Get-YtDlpYoutubeHlsExtractorArgs), @(
+    '-J'
+    '--no-download'
+    $Url
+  )
+
+  $previousErrorAction = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+
+  try {
+    $jsonLines = & yt-dlp @ytArgs 2>$null
+    if ($LASTEXITCODE -ne 0) {
+      throw 'yt-dlp 解析影片資訊失敗'
+    }
+
+    $jsonText = if ($jsonLines -is [array]) {
+      ($jsonLines | ForEach-Object { $_.ToString() }) -join "`n"
+    }
+    else {
+      [string]$jsonLines
+    }
+
+    if ([string]::IsNullOrWhiteSpace($jsonText)) {
+      throw 'yt-dlp 解析影片資訊失敗（空回應）'
+    }
+
+    $info = $jsonText | ConvertFrom-Json
+    if (-not $info) {
+      throw 'yt-dlp 解析影片資訊失敗（JSON 無效）'
+    }
+
+    if ($InfoJsonPath) {
+      [System.IO.File]::WriteAllText($InfoJsonPath, $jsonText, [System.Text.UTF8Encoding]::new($false))
+    }
+
+    $title = if ($info.title) { ([string]$info.title).Trim() } else { 'clip' }
+    if ([string]::IsNullOrWhiteSpace($title)) {
+      $title = 'clip'
+    }
+
+    return @{
+      Title = $title
+      Formats = @($info.formats)
+      JsonText = $jsonText
+      Info = $info
+      InfoJsonPath = $InfoJsonPath
+    }
+  }
+  finally {
+    $ErrorActionPreference = $previousErrorAction
+  }
+}
+
+function Select-HlsFormatFromInfo {
+  param(
+    [object[]]$Formats,
+    [string[]]$PreferredIds = @('301', '300', '96', '95', '93', '91')
+  )
+
+  $formats = @($Formats)
+  if ($formats.Count -eq 0) {
+    return $null
+  }
+
+  foreach ($id in $PreferredIds) {
+    $match = $formats | Where-Object { [string]$_.format_id -eq $id } | Select-Object -First 1
+    if (-not $match) {
+      continue
+    }
+
+    $url = if ($match.url) { [string]$match.url } elseif ($match.manifest_url) { [string]$match.manifest_url } else { $null }
+    if ([string]::IsNullOrWhiteSpace($url)) {
+      continue
+    }
+
+    return @{
+      FormatId = [string]$match.format_id
+      Url = $url
+      HttpHeaders = $match.http_headers
+      Height = $match.height
+    }
+  }
+
+  $hlsFormats = @(
+    $formats | Where-Object {
+      ($_.protocol -match 'm3u8') -and ($_.url -or $_.manifest_url)
+    } | Sort-Object {
+      if ($null -eq $_.height) { 0 } else { [int]$_.height }
+    } -Descending
+  )
+
+  $best = $hlsFormats | Select-Object -First 1
+  if (-not $best) {
+    return $null
+  }
+
+  $bestUrl = if ($best.url) { [string]$best.url } else { [string]$best.manifest_url }
+  return @{
+    FormatId = [string]$best.format_id
+    Url = $bestUrl
+    HttpHeaders = $best.http_headers
+    Height = $best.height
+  }
+}
+
+function ConvertTo-FfmpegHeadersArgument {
+  param($HttpHeaders)
+
+  if ($null -eq $HttpHeaders) {
+    return $null
+  }
+
+  $lines = [System.Collections.Generic.List[string]]::new()
+  foreach ($prop in $HttpHeaders.PSObject.Properties) {
+    if ([string]::IsNullOrWhiteSpace($prop.Name)) {
+      continue
+    }
+
+    [void]$lines.Add("$($prop.Name): $($prop.Value)")
+  }
+
+  if ($lines.Count -eq 0) {
+    return $null
+  }
+
+  return (($lines -join "`r`n") + "`r`n")
+}
+
+function Get-YoutubeVideoId {
+  param([string]$Url)
+
+  if ($Url -match '(?i)(?:youtu\.be/|v=|/shorts/|/live/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})') {
+    return $Matches[1]
+  }
+
+  if ($Url -match '^[a-zA-Z0-9_-]{11}$') {
+    return $Url
+  }
+
+  return (ConvertTo-SafeFileName $Url)
 }
 
 function ConvertTo-SafeFileName {
@@ -420,10 +578,14 @@ function Read-DownloadFallbackConfirmation {
   param(
     [switch]$DenoMissing,
     [switch]$BotBlocked,
-    [switch]$UncertainHls
+    [switch]$UncertainHls,
+    [switch]$HlsDownloadFailed
   )
 
-  if ($DenoMissing) {
+  if ($HlsDownloadFailed) {
+    $response = Read-Host '[!] HLS 片段下載失敗（格式可能已消失或不可用）。是否改整支下載後裁切？(Y/n)'
+  }
+  elseif ($DenoMissing) {
     $response = Read-Host '[!] 警告：目前無法取得 HLS/m3u8（需 Deno 完整解析 YouTube）。是否改整支下載後裁切？(Y/n)'
   }
   elseif ($BotBlocked) {
@@ -440,6 +602,55 @@ function Read-DownloadFallbackConfirmation {
   }
 
   return ($response -notmatch '^[Nn]')
+}
+
+function Invoke-YtDlpDownload {
+  param([string[]]$YtDlpArgs)
+
+  & yt-dlp @YtDlpArgs
+  return ($LASTEXITCODE -eq 0)
+}
+
+function Invoke-HlsSectionDownload {
+  param(
+    [string]$HlsUrl,
+    $HttpHeaders,
+    [string]$Start,
+    [string]$End,
+    [string]$OutputPath
+  )
+
+  $ffmpegArgs = [System.Collections.Generic.List[string]]::new()
+  foreach ($arg in @(
+      '-hide_banner'
+      '-loglevel', 'error'
+      '-nostats'
+      '-progress', 'pipe:1'
+      '-protocol_whitelist', 'file,http,https,tcp,tls,crypto'
+    )) {
+    [void]$ffmpegArgs.Add($arg)
+  }
+
+  $headerArg = ConvertTo-FfmpegHeadersArgument $HttpHeaders
+  if ($headerArg) {
+    [void]$ffmpegArgs.Add('-headers')
+    [void]$ffmpegArgs.Add($headerArg)
+  }
+
+  foreach ($arg in @(
+      '-ss', $Start
+      '-to', $End
+      '-i', $HlsUrl
+      '-map', '0:v:0'
+      '-map', '0:a:0?'
+      '-c', 'copy'
+      '-movflags', '+faststart'
+      '-y', $OutputPath
+    )) {
+    [void]$ffmpegArgs.Add($arg)
+  }
+
+  Invoke-FfmpegWithProgress -FfmpegArgs $ffmpegArgs.ToArray() -ProgressLabel 'HLS' -FailureMessage 'ffmpeg HLS 片段下載失敗'
 }
 
 function Write-InlineProgress {
@@ -612,11 +823,7 @@ function Invoke-ClipTranscode {
 }
 
 $workDir = Get-Location
-$section = "*$Start-$End"
-# HLS only（支援 --download-sections 只抓片段）；AV1 優先，無 AV1 時退回 H.264 HLS
-# 301/300=AV1 HLS，96/95=1080p/720p H.264 HLS，93/91=較低畫質 H.264 HLS
-$hlsFormat = '301/300/96/95/93/91'
-# 無 HLS 時整支下載：最佳視訊 + 最佳音訊，合併成 mp4
+# 無 HLS 時整支下載：最佳視訊 + 最佳音訊，合併成 mp4（透過 --load-info-json，不再重新解析）
 $fullFormat = 'bv*+ba/b'
 
 Write-Host ''
@@ -627,101 +834,124 @@ Write-Host ''
 
 $tempPath = $null
 $trimTempPath = $null
+$infoJsonPath = $null
 
 try {
   $jsArgs = Join-YtDlpArgs (Get-YtDlpJsRuntimeArgs), '--no-playlist'
-
-  Write-Step '正在檢查影片是否提供 HLS 串流...'
-  if (-not (Test-DenoAvailable)) {
-    Write-Host '[!] 未找到 Deno。YouTube HLS/m3u8 通常無法列出；HLS 檢查可能不準確。' -ForegroundColor Yellow
-  }
-
-  $hlsProbe = Test-VideoHasHls -JsArgs $jsArgs -Url $Url
-  $useHlsDownload = $hlsProbe.HasHls
-  if (-not $useHlsDownload) {
-    $denoMissing = -not (Test-DenoAvailable)
-    $botBlocked = $hlsProbe.BotBlocked
-    if ($botBlocked) {
-      Write-Host '[!] 若剛才測試多次，可稍等 15–30 分鐘或執行 yt-dlp --rm-cache-dir 後再試。' -ForegroundColor Yellow
-    }
-    if (-not (Read-DownloadFallbackConfirmation -DenoMissing:$denoMissing -BotBlocked:$botBlocked -UncertainHls:$hlsProbe.UncertainHls)) {
-      Write-Host ''
-      Write-Host '[!] 已停止下載。' -ForegroundColor Yellow
-      exit 0
-    }
-  }
-
-  if ($useHlsDownload) {
-    Write-Host '  方式  : HLS 片段下載（自動選最佳可用畫質）+ NVENC H.264 (CQ 35, 音訊 copy)'
-  }
-  else {
-    Write-Host '  方式  : 整支下載（最佳影音畫質）→ 裁切指定時段 → NVENC H.264 (CQ 35, 音訊 copy)'
-  }
-  Write-Host ''
-
-  Write-Step '正在取得 YouTube 影片名稱...'
-  $videoTitle = Get-VideoTitle -JsArgs $jsArgs -Url $Url
-
-  $safeTitle = ConvertTo-SafeFileName $videoTitle
+  $videoKey = Get-YoutubeVideoId $Url
   $timeRange = "$(ConvertTo-SafeTimeToken $Start)_$(ConvertTo-SafeTimeToken $End)"
+  $hlsTempPath = Join-Path $workDir "hls-$videoKey-$timeRange.mp4"
+  $fullTempPath = Join-Path $workDir "full-$videoKey-$timeRange.mp4"
+  $infoJsonPath = Join-Path $workDir "temp-info-$videoKey.json"
+  $useHlsDownload = $false
+
+  if (-not (Test-DenoAvailable)) {
+    Write-Host '[!] 未找到 Deno。YouTube HLS/m3u8 通常需要 Deno；若無 HLS 會改整支下載。' -ForegroundColor Yellow
+    Write-Host ''
+  }
+
+  Write-Step '正在解析影片資訊...'
+  $videoInfo = Get-YtDlpVideoInfo -JsArgs $jsArgs -Url $Url -InfoJsonPath $infoJsonPath
+  $videoTitle = $videoInfo.Title
+  $safeTitle = ConvertTo-SafeFileName $videoTitle
   $finalName = "clip-$safeTitle-$timeRange.mp4"
   $outputPath = Join-Path $workDir $finalName
-  $tempPath = Join-Path $workDir "temp-$finalName"
 
   Write-Host "  名稱  : $videoTitle"
-  Write-Host "  暫存  : $tempPath"
+  Write-Host "  資訊  : $infoJsonPath"
   Write-Host "  輸出  : $outputPath"
   Write-Host ''
 
-  if ($useHlsDownload) {
-    Write-Step '正在解析影片並下載指定片段 (yt-dlp)...'
+  if (Test-UsableMediaFile $hlsTempPath) {
+    Write-Host "[!] 發現既有 HLS 暫存檔 ($(Get-MediaFileSizeMb $hlsTempPath) MB)，跳過下載。" -ForegroundColor Yellow
+    Write-Host ''
+    $useHlsDownload = $true
+    $tempPath = $hlsTempPath
+  }
+  elseif (Test-UsableMediaFile $fullTempPath) {
+    Write-Host "[!] 發現既有完整暫存檔 ($(Get-MediaFileSizeMb $fullTempPath) MB)，跳過下載。" -ForegroundColor Yellow
+    Write-Host ''
+    $useHlsDownload = $false
+    $tempPath = $fullTempPath
   }
   else {
-    Write-Step '正在下載完整影片 (yt-dlp，最佳影音畫質)...'
-  }
+    $hlsFormatInfo = Select-HlsFormatFromInfo -Formats $videoInfo.Formats
+    $needFullDownload = $false
 
-  if (Test-UsableMediaFile $tempPath) {
-    Write-Host "[!] 發現既有暫存檔 ($(Get-MediaFileSizeMb $tempPath) MB)，跳過下載，直接繼續後續步驟。" -ForegroundColor Yellow
-    Write-Host ''
-  }
-  else {
-    Write-Host '      解析完後進度會在同一行更新，請稍候'
-    Write-Host ''
+    if ($hlsFormatInfo) {
+      Write-Host "  方式  : HLS 片段（format $($hlsFormatInfo.FormatId)）→ ffmpeg 直抓 → NVENC"
+      Write-Host ''
+      Write-Step "正在以 ffmpeg 下載 HLS 片段 $($hlsFormatInfo.FormatId)..."
+      Write-Host ''
 
-    if ($useHlsDownload) {
-      $ytDlpArgs = Join-YtDlpArgs $jsArgs, (Get-YtDlpHlsDownloadArgs), @(
-        '--download-sections', $section
-        '--force-keyframes-at-cuts'
-        '-f', $hlsFormat
-        '--force-overwrites'
-        '--no-part'
-        '--progress'
-        '--downloader-args', 'ffmpeg:-loglevel warning -stats -stats_period 2'
-        '-o', $tempPath
-        $Url
-      )
+      try {
+        Invoke-HlsSectionDownload -HlsUrl $hlsFormatInfo.Url -HttpHeaders $hlsFormatInfo.HttpHeaders -Start $Start -End $End -OutputPath $hlsTempPath
+        if (Test-UsableMediaFile $hlsTempPath) {
+          $useHlsDownload = $true
+          $tempPath = $hlsTempPath
+        }
+        else {
+          throw 'ffmpeg HLS 下載後找不到可用暫存檔'
+        }
+      }
+      catch {
+        Write-Host ''
+        Write-Host "[!] HLS 片段下載失敗：$($_.Exception.Message)" -ForegroundColor Yellow
+        if (-not (Read-DownloadFallbackConfirmation -HlsDownloadFailed)) {
+          if ($infoJsonPath -and (Test-Path $infoJsonPath)) {
+            Remove-Item $infoJsonPath -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host ''
+          Write-Host '[!] 已停止下載。' -ForegroundColor Yellow
+          exit 0
+        }
+
+        $needFullDownload = $true
+      }
     }
     else {
-      $ytDlpArgs = Join-YtDlpArgs $jsArgs, (Get-YtDlpHlsDownloadArgs), @(
+      Write-Host '[!] 這次解析結果沒有可用的 HLS/m3u8。' -ForegroundColor Yellow
+      if (-not (Read-DownloadFallbackConfirmation)) {
+        if ($infoJsonPath -and (Test-Path $infoJsonPath)) {
+          Remove-Item $infoJsonPath -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host ''
+        Write-Host '[!] 已停止下載。' -ForegroundColor Yellow
+        exit 0
+      }
+
+      $needFullDownload = $true
+    }
+
+    if ($needFullDownload) {
+      $useHlsDownload = $false
+      $tempPath = $fullTempPath
+      Write-Host ''
+      Write-Host '  方式  : 整支下載（--load-info-json，不重新解析）→ 裁切 → NVENC'
+      Write-Host ''
+      Write-Step '正在下載完整影片 (yt-dlp --load-info-json)...'
+      Write-Host '      進度會在同一行更新，請稍候'
+      Write-Host ''
+
+      $fullDownloadArgs = @(
+        '--load-info-json', $infoJsonPath
         '-f', $fullFormat
         '--merge-output-format', 'mp4'
         '--force-overwrites'
         '--no-part'
         '--progress'
         '--downloader-args', 'ffmpeg:-loglevel warning -stats -stats_period 2'
-        '-o', $tempPath
-        $Url
+        '-o', $fullTempPath
       )
-    }
 
-    & yt-dlp @ytDlpArgs
-    if ($LASTEXITCODE -ne 0) {
-      if (Test-UsableMediaFile $tempPath) {
-        Write-Host "[!] 下載失敗，但暫存檔可用 ($(Get-MediaFileSizeMb $tempPath) MB)，繼續後續步驟。" -ForegroundColor Yellow
-        Write-Host ''
-      }
-      else {
+      $fullOk = Invoke-YtDlpDownload -YtDlpArgs $fullDownloadArgs
+      if (-not ($fullOk -or (Test-UsableMediaFile $fullTempPath))) {
         throw 'yt-dlp 下載失敗'
+      }
+
+      if (-not $fullOk) {
+        Write-Host "[!] 下載失敗，但暫存檔可用 ($(Get-MediaFileSizeMb $fullTempPath) MB)，繼續後續步驟。" -ForegroundColor Yellow
+        Write-Host ''
       }
     }
   }
@@ -730,7 +960,15 @@ try {
     throw "找不到暫存檔案：$tempPath"
   }
 
+  Write-Host "  暫存  : $tempPath"
+  if ($useHlsDownload) {
+    Write-Host '  方式  : HLS 片段 + NVENC H.264 (CQ 35, 音訊 copy)'
+  }
+  else {
+    Write-Host '  方式  : 整支下載 → 裁切 → NVENC H.264 (CQ 35, 音訊 copy)'
+  }
   Write-Host ''
+
   if ($useHlsDownload) {
     Write-Step '正在轉檔 (ffmpeg NVENC H.264 CQ 35, 音訊 copy, VFR, faststart)...'
     Write-Host ''
@@ -767,19 +1005,16 @@ try {
     Write-Done "完成！檔案已輸出 $outputPath ($sizeMb MB)"
     Write-ShareText -Title $videoTitle -Url $Url -Start $Start -End $End
 
-    if (Test-Path $tempPath) {
-      Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
+    # 保留 hls-/full-/trim-/clip- 等 mp4；只清掉一次解析用的 temp-info JSON
+    if ($infoJsonPath -and (Test-Path $infoJsonPath)) {
+      Remove-Item $infoJsonPath -Force -ErrorAction SilentlyContinue
     }
 
-    if ($trimTempPath -and (Test-Path $trimTempPath)) {
-      Remove-Item $trimTempPath -Force -ErrorAction SilentlyContinue
-    }
-
-    Get-ChildItem -Path $workDir -Filter "temp-$finalName*" -ErrorAction SilentlyContinue |
+    Get-ChildItem -Path $workDir -Filter "hls-$videoKey-$timeRange*" -ErrorAction SilentlyContinue |
       Where-Object { $_.Name -like '*.part' -or $_.Name -like '*.ytdl' } |
       Remove-Item -Force -ErrorAction SilentlyContinue
 
-    Get-ChildItem -Path $workDir -Filter "trim-$finalName*" -ErrorAction SilentlyContinue |
+    Get-ChildItem -Path $workDir -Filter "full-$videoKey-$timeRange*" -ErrorAction SilentlyContinue |
       Where-Object { $_.Name -like '*.part' -or $_.Name -like '*.ytdl' } |
       Remove-Item -Force -ErrorAction SilentlyContinue
   }
@@ -797,6 +1032,10 @@ catch {
   if ($trimTempPath -and (Test-Path $trimTempPath)) {
     Write-Host "[!] 已保留裁切暫存檔：$trimTempPath" -ForegroundColor Yellow
     Write-Host '    可稍後手動轉檔，或重新執行 yt-best' -ForegroundColor Yellow
+  }
+
+  if ($infoJsonPath -and (Test-Path $infoJsonPath)) {
+    Write-Host "[!] 已保留解析 JSON：$infoJsonPath" -ForegroundColor Yellow
   }
 
   if ($_.Exception.Message -notmatch 'Pipeline has been stopped|Operation canceled') {

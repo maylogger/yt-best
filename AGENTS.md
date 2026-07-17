@@ -87,45 +87,61 @@ PSInvalidOperationException: There is no Runspace available to run scripts in th
 
 | 檔案 | 行為 |
 |------|------|
-| `temp-clip-....mp4` | 存在則跳過 yt-dlp 下載；下載失敗但檔案可用也繼續 |
-| `trim-clip-....mp4` | 通過 `Test-UsableTrimFile` 才跳過裁切 |
+| `temp-info-....json` | 一次 `-J` 的完整資訊；備援用 `--load-info-json`；成功後可刪 |
+| `hls-....mp4` | 存在則跳過 HLS 下載；完成後保留 |
+| `full-....mp4` | 存在則跳過整支下載，走裁切路徑；完成後保留 |
+| `trim-clip-....mp4` | 通過 `Test-UsableTrimFile` 才跳過裁切；完成後保留 |
 
 `Test-UsableTrimFile` 會拒絕異常大的裁切檔（例如 32 秒片段卻有 1103 MB），並強制重新裁切。
 
-## 7. 整體流程（無 HLS 備援路徑）
+成功後保留所有相關 `.mp4`（`hls-` / `full-` / `trim-` / `clip-`），只刪除 `temp-info-*.json` 與 `.part` / `.ytdl` 殘檔。
+
+## 7. 整體流程
+
+**優先路徑（HLS）：** 只呼叫一次 `yt-dlp -J`，從 JSON 取 m3u8 URL 交給 ffmpeg。
 
 ```
-yt-dlp 整支下載 → temp-*.mp4
+yt-dlp -J（一次）→ temp-info-*.json
+    ↓
+ffmpeg -ss/-to -i m3u8_url -c copy → hls-*.mp4   （進度：[HLS]）
+    ↓
+ffmpeg NVENC 轉檔 → clip-*.mp4                    （進度：[ENC]）
+```
+
+**備援路徑（JSON 無 HLS / ffmpeg HLS 失敗）：**
+
+```
+yt-dlp --load-info-json temp-info-*.json（不重新解析）→ full-*.mp4
     ↓
 ffmpeg stream copy 裁切 → trim-*.mp4   （進度：[TRIM]）
     ↓
 ffmpeg NVENC 轉檔 → clip-*.mp4          （進度：[ENC]）
 ```
 
-HLS 路徑跳過裁切，yt-dlp 直接下載片段後只做 `[ENC]` 轉檔。
-
-## 8. HLS 偵測需要 Deno，不可強制 `--js-runtimes node`
+## 8. HLS：一次 `-J`，不要 `-F` 再 `-f` 重新解析
 
 ### 現象
 
-手動 `yt-dlp -F` 看得到 `m3u8`，但 `Test-VideoHasHls` 回報沒有 HLS。
+手動 `yt-dlp -F` 有時看得到 `m3u8`，再查一次（或接著 `-f` 下載）就消失，只剩 DASH `https`，報 `Requested format is not available`。
 
 ### 原因
 
-YouTube 的 m3u8 清單需透過 **Deno** 解 JS challenge，且 yt-dlp 會做**額外 API 請求**才列出 m3u8。
+YouTube 的 m3u8 需透過 **Deno** 解 JS challenge，且常只在**某一次**完整解析時出現。
 
-若走快取的 `android vr` 精簡路徑（第二次 `-F` 常見），會**跳過** `Downloading player`、`[jsc:deno]`、`Downloading m3u8 information`，格式表只剩 `https`（DASH）。這不是影片沒有 HLS，而是 yt-dlp 沒去查。
+若先 `-F` / 取標題再 `-f` 下載，等於把「有 HLS 的那一次」用掉；後續請求常走 `android vr` 精簡路徑。
 
 ### 規則
 
-- HLS **檢查**必須加：`--no-cache-dir` + `--extractor-args youtube:player_client=web_safari,default`
-- HLS **下載**也要加：`--extractor-args youtube:player_client=web_safari,default`
+- **主流程只呼叫一次 `yt-dlp -J`**（含 `web_safari,default` + `--no-cache-dir`），取得 title / formats / url。
+- 有 HLS：把 `formats[].url`（與 `http_headers`）直接丟給 **ffmpeg** 做 `-ss/-to` 片段下載；**不要**再呼叫 yt-dlp `-f`。
+- 無 HLS 或 ffmpeg HLS 失敗：用 **`yt-dlp --load-info-json`** 整支下載（重用同一份 JSON，不重新走 extractor）。
+- 禁止主流程先 `Test-VideoHasHls` / `-F` 再下載。
+- `-ss` / `-to` 必須在 ffmpeg `-i` **前面**（與裁切規則相同）。
 - 用 `Get-DenoExecutable` 找 Deno（PATH + `%USERPROFILE%\.deno\bin` 等常見路徑）。
 - PATH 已有 `deno` 時**不要**傳 `--js-runtimes`（yt-dlp 預設啟用 deno）。
 - 必須傳路徑時用 `deno:C:/Users/.../deno.exe`（**正斜線**），避免 `deno:C:\` 被截斷。
 - **不要**在沒有 Deno 時強制 `--js-runtimes node`。
-- HLS 檢查用 `yt-dlp -J` 解析 `formats[].protocol`，不要只靠 `-F | Out-String` 搜尋 `m3u8` 字串。
-- `Test-VideoHasHls` 應以多組 js runtime 參數重試（原參數、空參數、`deno`、`deno:/path`）。
+- `Test-VideoHasHls` 僅保留作除錯；正常下載路徑不要呼叫。
 
 ## 9. 改完必做
 
